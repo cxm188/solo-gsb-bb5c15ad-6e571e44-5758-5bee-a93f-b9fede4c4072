@@ -27,7 +27,7 @@ from .solver import (
     suggest_repairs,
 )
 
-app = FastAPI(title="口述史事件时间线核对", version="1.11.0")
+app = FastAPI(title="口述史事件时间线核对", version="1.12.0")
 
 
 class SolveRequest(BaseModel):

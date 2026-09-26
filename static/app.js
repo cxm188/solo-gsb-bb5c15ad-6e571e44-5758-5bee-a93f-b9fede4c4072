@@ -18,8 +18,8 @@ const EXAMPLE_CONFLICT = [
   "晚饭,早饭,20,50",
 ].join("\n");
 
-// 两版比较示例：修订版放宽了前两链下界、把“出门”合并掉（删除事件），
-// 并新增“午休、下班”事件链。
+// 两版比较示例：修订版放宽了前两链下界（洗漱、早饭相对共享参考“起床”的上下界均变化）、
+// 把“出门”合并掉（删除事件），并新增“午休、下班”事件链。
 const EXAMPLE_COMPARE_BASE = [
   "起床,洗漱,10,30",
   "洗漱,早饭,15,45",
@@ -843,6 +843,7 @@ refreshLineOptions();
 const KIND_LABEL = {
   changed: "变化",
   unchanged: "未变",
+  reference: "参考",
   added: "新增",
   removed: "删除",
   incomparable: "不可比",
@@ -854,19 +855,28 @@ const CHANGE_LABEL = {
   unchanged: "区间未改",
 };
 
-function fmtDelta(delta) {
+const ENDPOINT_LABEL = { low: "下界", high: "上界" };
+
+// 端点变化文案：正数表示该端点增大，负数表示收紧
+function fmtBoundDelta(delta) {
   if (delta === null || delta === undefined) return { text: "—", cls: "delta-na" };
   if (delta > 0) return { text: `+${delta}`, cls: "delta-up" };
   if (delta < 0) return { text: `−${Math.abs(delta)}`, cls: "delta-down" };
   return { text: "0", cls: "delta-zero" };
 }
 
+function fmtInterval(lo, hi) {
+  if (lo === null || lo === undefined || hi === null || hi === undefined) return "—";
+  return lo === hi ? `[${lo}]` : `[${lo}, ${hi}]`;
+}
+
 function fmtMinute(m) {
   return m === null || m === undefined ? "—" : m;
 }
 
-// 证据明细表：在冗余核对路径表基础上增加该行相对基准的变化标记
-function comparePathTableHtml(steps) {
+// 单侧推导路径明细表：行号即该侧版本的原始行号；修订侧额外显示该行相对基准的变化标记
+function comparePathTableHtml(steps, side) {
+  const lineHead = side === "revised" ? "修订行号" : "基准行号";
   const rows = steps.map((s) => `
     <tr>
       <td class="num">${s.line}</td>
@@ -874,85 +884,147 @@ function comparePathTableHtml(steps) {
       <td><span class="tag ${s.kind}">${esc(s.kind_label)}</span></td>
       <td class="num">${s.bound}</td>
       <td>${esc(s.relation)}</td>
-      <td>${s.change ? `<span class="change-tag ${s.change}">${esc(CHANGE_LABEL[s.change] || s.change)}</span>` : ""}</td>
+      ${side === "revised"
+        ? `<td>${s.change ? `<span class="change-tag ${s.change}">${esc(CHANGE_LABEL[s.change] || s.change)}</span>` : ""}</td>`
+        : `<td class="muted">—</td>`}
     </tr>`).join("");
   return `
     <table>
       <thead><tr>
-        <th class="num">修订行号</th><th>图中方向</th><th>使用的界</th>
-        <th class="num">界值</th><th>含义</th><th>相对基准</th>
+        <th class="num">${lineHead}</th><th>图中方向</th><th>使用的界</th>
+        <th class="num">界值</th><th>含义</th><th>相对另一版</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
 
 function renderCompareOk(data) {
+  const refName = data.reference;
+
   const rows = data.alignment.map((e) => {
-    // 后端共同事件统一为 common；有证据（delta≠0 且可比较）显示为“变化”，否则“未变”
-    const renderKind = e.kind === "common"
-      ? (e.evidence ? "changed" : "unchanged")
-      : e.kind;
-    const d = fmtDelta(e.delta);
-    let lines = "";
-    if (e.evidence) {
-      lines = e.evidence.is_anchor
-        ? `<span class="evidence-lines">（第 0 分钟锚点事件）</span>`
-        : `<span class="evidence-lines">第 ${e.evidence.lines.join("、")} 行</span>`;
+    if (e.kind === "added") {
+      return `<tr>
+        <td><span class="kind-tag added">${KIND_LABEL.added}</span></td>
+        <td>${esc(e.event)}</td>
+        <td class="num" colspan="2"><span class="muted">仅修订版事件（修订样本时刻 ${fmtMinute(e.revised_minute)}，不参与区间比较）</span></td>
+        <td class="num" colspan="2">—</td>
+      </tr>`;
     }
-    return `<tr>
-      <td><span class="kind-tag ${renderKind}">${esc(KIND_LABEL[renderKind] || renderKind)}</span></td>
-      <td>${esc(e.event)}</td>
-      <td class="num">${fmtMinute(e.base_minute)}</td>
-      <td class="num">${fmtMinute(e.revised_minute)}</td>
-      <td class="num ${d.cls}">${d.text}</td>
-      <td>${lines}</td>
+    if (e.kind === "removed") {
+      return `<tr>
+        <td><span class="kind-tag removed">${KIND_LABEL.removed}</span></td>
+        <td>${esc(e.event)}</td>
+        <td class="num" colspan="2"><span class="muted">仅基准版事件（基准样本时刻 ${fmtMinute(e.base_minute)}，不参与区间比较）</span></td>
+        <td class="num" colspan="2">—</td>
+      </tr>`;
+    }
+
+    // common / incomparable
+    let renderKind;
+    if (!e.comparable) renderKind = "incomparable";
+    else if (e.is_reference) renderKind = "reference";
+    else if (e.low_changed || e.high_changed) renderKind = "changed";
+    else renderKind = "unchanged";
+
+    let intervalCells;
+    let deltaCells;
+    if (!e.comparable) {
+      const why = !e.base_connected && !e.revised_connected
+        ? "两版均不与参考连通"
+        : !e.base_connected
+          ? "基准版不与参考连通"
+          : "修订版不与参考连通";
+      intervalCells = `<td class="num" colspan="2"><span class="muted">不可比（${why}）</span></td>`;
+      deltaCells = `<td class="num" colspan="2"><span class="muted">隐藏差值</span></td>`;
+    } else {
+      intervalCells = `
+        <td class="num">${fmtInterval(e.base_low, e.base_high)}</td>
+        <td class="num">${fmtInterval(e.revised_low, e.revised_high)}</td>`;
+      const dl = fmtBoundDelta(e.low_delta);
+      const dh = fmtBoundDelta(e.high_delta);
+      deltaCells = `
+        <td class="num">${e.low_changed ? `<span class="${dl.cls} endpoint-delta">${dl.text}</span>` : '<span class="delta-zero">0</span>'}</td>
+        <td class="num">${e.high_changed ? `<span class="${dh.cls} endpoint-delta">${dh.text}</span>` : '<span class="delta-zero">0</span>'}</td>`;
+    }
+
+    return `<tr${renderKind === "incomparable" ? ' class="row-incomparable"' : ""}>
+      <td><span class="kind-tag ${renderKind}">${esc(KIND_LABEL[renderKind])}</span></td>
+      <td>${esc(e.event)}${e.is_reference ? ` <span class="muted">（共享参考）</span>` : ""}</td>
+      ${intervalCells}
+      ${deltaCells}
     </tr>`;
   }).join("");
 
-  const shiftNote = data.anchor_shifted
-    ? `<p class="muted">⚠ 两版第 0 分钟事件不同（基准：${esc(data.base.anchor)}；修订：${esc(data.revised.anchor)}）。
-       分钟数仍各自从本版最早事件起算；与公共锚点不连通的事件标为<strong>“不可比”</strong>，其分钟差只是各事件组件独立归零的结果，不构成修订变化。</p>`
-    : `<p class="muted">两版共同以“${esc(data.base.anchor)}”为第 0 分钟事件，变化分钟数即相对同一锚点的时刻差。</p>`;
+  const refNote = refName
+    ? `<p class="muted">两版共享参考取<strong>基准版中首次出现的共同事件“${esc(refName)}”</strong>；
+       表中为各共同事件相对该参考的<strong>最紧时间差区间</strong>（参考自身恒为 [0]）。
+       只有下界或上界在两版间发生变化才计为<strong>变化</strong>；新增前置事件只改变各版自己的归零样本时刻，
+       不改变共同事件相对共享参考的区间。某事件在任一版中与参考不连通时标为<strong>不可比</strong>：
+       两版各自归零的样本时刻不能互相比较，故隐藏差值与变化证据。</p>`
+    : `<p class="muted">两版<strong>没有共同事件</strong>，没有可共享的参考事件，因此不做任何区间或端点比较，仅列出新增与删除事件。</p>`;
 
   const banner = `
     <div class="banner ok">
       <h2>✓ 两版比较完成</h2>
-      <p>共同事件 ${data.common_count} 个（其中 <strong>${data.changed_count}</strong> 个分钟发生变化）；
+      <p>共同事件 ${data.common_count} 个（其中 <strong>${data.changed_count}</strong> 个事件、
+      <strong>${data.changed_endpoint_count}</strong> 个端点发生变化）；
       修订版新增 <strong>${data.added_count}</strong> 个事件、删除 <strong>${data.removed_count}</strong> 个事件
-      ${data.incomparable_count ? `、<strong>${data.incomparable_count}</strong> 个事件与锚点不连通、不可比` : ""}。
+      ${data.incomparable_count ? `、<strong>${data.incomparable_count}</strong> 个事件与参考不连通、不可比` : ""}。
       基准 ${data.base.line_count} 行 / ${data.base.event_count} 事件；修订 ${data.revised.line_count} 行 / ${data.revised.event_count} 事件。</p>
     </div>`;
 
   const tableCard = `
     <div class="card">
-      <h3>事件对齐表</h3>
+      <h3>共同事件区间对齐表</h3>
       <table>
         <thead><tr>
           <th>类型</th><th>事件</th>
-          <th class="num">基准时刻</th><th class="num">修订时刻</th>
-          <th class="num">变化分钟</th><th>导致变化的修订行</th>
+          <th class="num">基准区间</th><th class="num">修订区间</th>
+          <th class="num">下界差值</th><th class="num">上界差值</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
-      ${shiftNote}
+      ${refNote}
     </div>`;
 
-  // 仅为“分钟发生变化”的共同事件展开修订时刻的推导路径证据
+  // 每个发生端点变化的共同事件：逐端点给出两版各自的原始行号、所用界值与连续推导路径
   const evidenceCards = data.alignment
-    .filter((e) => e.kind === "common" && e.evidence && !e.evidence.is_anchor)
+    .filter((e) => e.kind === "common" && e.evidence)
     .map((e) => {
-      const ev = e.evidence;
-      const d = fmtDelta(e.delta);
-      const dirText = ev.direction === "upper"
-        ? `修订时刻顶在该事件相对锚点的最紧<strong>上界 ${ev.bound}</strong>。`
-        : `修订时刻顶在该事件相对锚点的最紧<strong>下界 ${ev.bound}</strong>。`;
+      const epBlocks = ["low", "high"]
+        .filter((ep) => e.evidence[ep])
+        .map((ep) => {
+          const ev = e.evidence[ep];
+          const delta = ep === "low" ? e.low_delta : e.high_delta;
+          const d = fmtBoundDelta(delta);
+          const verb = ep === "low"
+            ? (delta > 0 ? "增大" : "减小")
+            : (delta > 0 ? "增大" : "减少");
+          const head = `
+            <div class="endpoint-ev-head">
+              <strong>${ENDPOINT_LABEL[ep]}变化：${d.text} 分钟</strong>
+              （基准 ${ev.base.bound} → 修订 ${ev.revised.bound}，${verb} ${Math.abs(delta)} 分钟）
+            </div>`;
+          const sideBlock = (title, sideEv, side) => `
+            <div class="ev-side">
+              <div class="ev-side-title">${title}：${ENDPOINT_LABEL[ep]} = <strong>${sideEv.bound}</strong>，
+              由第 ${sideEv.lines.length ? sideEv.lines.join("、") : "—"} 行连续推出</div>
+              ${sideEv.path.length ? pathChainHtml(sideEv.path) : `<p class="muted">参考事件自身，时间差恒为 0。</p>`}
+              ${sideEv.path.length ? comparePathTableHtml(sideEv.path, side) : ""}
+            </div>`;
+          return `
+            <div class="endpoint-ev">
+              ${head}
+              <div class="ev-side-grid">
+                ${sideBlock("基准版推导", ev.base, "base")}
+                ${sideBlock("修订版推导", ev.revised, "revised")}
+              </div>
+            </div>`;
+        }).join("");
       return `
       <div class="card evidence-card">
-        <h3>变更行证据：${esc(e.event)}（${e.base_minute} → ${e.revised_minute}，${d.text} 分钟）</h3>
-        <p class="ev-head">${dirText}推出该时刻用到的修订行为<strong>第 ${ev.lines.join("、")} 行</strong>；
-        路径每环标注修订行号、所用界值，以及该行相对基准是“已修改 / 新增 / 区间未改”。</p>
-        ${pathChainHtml(ev.path)}
-        ${comparePathTableHtml(ev.path)}
+        <h3>变化端点证据：${esc(e.event)}　基准 ${fmtInterval(e.base_low, e.base_high)} → 修订 ${fmtInterval(e.revised_low, e.revised_high)}</h3>
+        ${epBlocks}
       </div>`;
     }).join("");
 
