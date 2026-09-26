@@ -18,8 +18,9 @@ const EXAMPLE_CONFLICT = [
   "晚饭,早饭,20,50",
 ].join("\n");
 
-// 两版比较示例：修订版放宽了前两链下界、把“出门”合并掉（删除事件），
-// 并新增“午休、下班”事件链。
+// 两版比较示例：以基准首个共同事件“起床”为共享参考；修订版放宽了前两链界值
+// （洗漱、早饭相对起床的区间端点整体后移）、把“出门”合并掉（删除事件），
+// 并新增“午休、下班”事件链；“开会”上界因链式推导由 225 收紧为 185。
 const EXAMPLE_COMPARE_BASE = [
   "起床,洗漱,10,30",
   "洗漱,早饭,15,45",
@@ -854,6 +855,8 @@ const CHANGE_LABEL = {
   unchanged: "区间未改",
 };
 
+const ENDPOINT_LABEL = { lower: "下界", upper: "上界" };
+
 function fmtDelta(delta) {
   if (delta === null || delta === undefined) return { text: "—", cls: "delta-na" };
   if (delta > 0) return { text: `+${delta}`, cls: "delta-up" };
@@ -861,11 +864,39 @@ function fmtDelta(delta) {
   return { text: "0", cls: "delta-zero" };
 }
 
-function fmtMinute(m) {
-  return m === null || m === undefined ? "—" : m;
+// 单个界值显示：无界按端点显示 −∞ / +∞
+function fmtBound(v, side) {
+  if (v === null || v === undefined) return side === "lower" ? "−∞" : "+∞";
+  return String(v);
 }
 
-// 证据明细表：在冗余核对路径表基础上增加该行相对基准的变化标记
+// 一版相对参考的最紧区间：两端都无界（不连通）时显示 —
+function fmtInterval(lo, hi) {
+  if (lo === null && hi === null) return "—";
+  return `[${fmtBound(lo, "lower")}, ${fmtBound(hi, "upper")}]`;
+}
+
+// 端点差值：两版都有界时显示带符号分钟差；一端无界时显示“界 ↔ 无界”迁移；两端均无界显示 —
+function fmtEndpointDelta(e, side) {
+  const bv = side === "lower" ? e.base_low : e.base_high;
+  const rv = side === "lower" ? e.revised_low : e.revised_high;
+  const delta = side === "lower" ? e.low_delta : e.high_delta;
+  const changed = side === "lower" ? e.low_changed : e.high_changed;
+  const inf = side === "lower" ? "−∞" : "+∞";
+  if (bv === null && rv === null) return { text: "—", cls: "delta-na" };
+  if (!changed) return { text: "0", cls: "delta-zero" };
+  if (bv !== null && rv !== null) return fmtDelta(delta);
+  // 一端有界、一端无界：着色按端点“变大/变小”（下界的 −∞ 视为最小，上界的 +∞ 视为最大）
+  const grew = side === "lower"
+    ? (bv === null ? true : false)
+    : (rv === null ? true : false);
+  return {
+    text: `${bv === null ? inf : bv} → ${rv === null ? inf : rv}`,
+    cls: grew ? "delta-up" : "delta-down",
+  };
+}
+
+// 证据明细表：在冗余核对路径表基础上增加该行相对基准的变化标记（修订版路径专用）
 function comparePathTableHtml(steps) {
   const rows = steps.map((s) => `
     <tr>
@@ -879,82 +910,168 @@ function comparePathTableHtml(steps) {
   return `
     <table>
       <thead><tr>
-        <th class="num">修订行号</th><th>图中方向</th><th>使用的界</th>
+        <th class="num">行号</th><th>图中方向</th><th>使用的界</th>
         <th class="num">界值</th><th>含义</th><th>相对基准</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
 
+// 一个端点在一版中的推导区块：所用界值、原始行号、连续推导路径链图与明细表
+function endpointPathBlock(versionLabel, sideEvidence, revisedSide) {
+  const boundText = sideEvidence.bounded
+    ? `最紧${ENDPOINT_LABEL[sideEvidence.side]} <strong>${sideEvidence.bound}</strong>`
+    : "该端点<strong>无界</strong>";
+  if (!sideEvidence.bounded) {
+    return `
+      <div class="card evidence-side">
+        <h4>${versionLabel}</h4>
+        <p class="ev-head">${boundText}：这一版中不存在从参考事件到该事件（该方向）的任何推导路径，
+        给不出该端点的界值。</p>
+      </div>`;
+  }
+  const linesText = sideEvidence.lines.length
+    ? `推导连续路径用到<strong>第 ${sideEvidence.lines.join("、")} 行</strong>`
+    : "两事件为同一事件，无需任何其他约束";
+  const table = revisedSide
+    ? comparePathTableHtml(sideEvidence.path)
+    : pathTableHtml(sideEvidence.path);
+  return `
+    <div class="card evidence-side">
+      <h4>${versionLabel}：${boundText}</h4>
+      <p class="ev-head">${linesText}；沿路径各边界值相加即该最紧界。</p>
+      ${pathChainHtml(sideEvidence.path)}
+      ${table}
+    </div>`;
+}
+
+// 一个变化端点的完整证据卡：两版各自的原始行号、所用界值与连续推导路径
+function endpointEvidenceCard(reference, e, side) {
+  const label = ENDPOINT_LABEL[side];
+  const bv = side === "lower" ? e.base_low : e.base_high;
+  const rv = side === "lower" ? e.revised_low : e.revised_high;
+  const d = fmtEndpointDelta(e, side);
+  const baseSide = { side, ...e.evidence[side].base };
+  const revisedSide = { side, ...e.evidence[side].revised };
+  return `
+  <div class="card evidence-card">
+    <h3>变化端点证据：${esc(e.event)} 相对参考 ${esc(reference)} 的${label}（${fmtBound(bv, side)} → ${fmtBound(rv, side)}，<span class="${d.cls}">${esc(d.text)}</span> 分钟）</h3>
+    <div class="compare-cols">
+      ${endpointPathBlock("基准版推导", baseSide, false)}
+      ${endpointPathBlock("修订版推导", revisedSide, true)}
+    </div>
+  </div>`;
+}
+
+// 表格中变化端点摘要：端点界值迁移 + 两版所用原始行号
+function evidenceSummary(e) {
+  if (!e.evidence) return "";
+  return ["lower", "upper"].filter((side) => e.evidence[side]).map((side) => {
+    const bv = side === "lower" ? e.base_low : e.base_high;
+    const rv = side === "lower" ? e.revised_low : e.revised_high;
+    const bep = e.evidence[side].base;
+    const rep = e.evidence[side].revised;
+    const baseText = bep.bounded ? `基准第 ${bep.lines.join("、")} 行` : "基准无界";
+    const revText = rep.bounded ? `修订第 ${rep.lines.join("、")} 行` : "修订无界";
+    return `<div class="evidence-lines">${ENDPOINT_LABEL[side]} ${fmtBound(bv, side)} → ${fmtBound(rv, side)}；${baseText}；${revText}</div>`;
+  }).join("");
+}
+
 function renderCompareOk(data) {
+  const reference = data.reference;
+
   const rows = data.alignment.map((e) => {
-    // 后端共同事件统一为 common；有证据（delta≠0 且可比较）显示为“变化”，否则“未变”
+    // 共同事件：有端点变化才显示“变化”，否则“未变”；参考事件恒未变
     const renderKind = e.kind === "common"
-      ? (e.evidence ? "changed" : "unchanged")
+      ? (e.changed ? "changed" : "unchanged")
       : e.kind;
-    const d = fmtDelta(e.delta);
-    let lines = "";
-    if (e.evidence) {
-      lines = e.evidence.is_anchor
-        ? `<span class="evidence-lines">（第 0 分钟锚点事件）</span>`
-        : `<span class="evidence-lines">第 ${e.evidence.lines.join("、")} 行</span>`;
+    const eventCell = e.is_reference
+      ? `${esc(e.event)} <span class="tag exact">参考事件</span>`
+      : esc(e.event);
+
+    let baseInterval;
+    let revisedInterval;
+    let lowCell;
+    let highCell;
+    let summary;
+    if (e.kind === "incomparable") {
+      // 不可比：给出各版能推出的区间（不连通的一版为 —），隐藏端点差值与变化证据
+      baseInterval = fmtInterval(e.base_low, e.base_high);
+      revisedInterval = fmtInterval(e.revised_low, e.revised_high);
+      lowCell = highCell = '<span class="delta-na">—</span>';
+      summary = '<span class="evidence-lines">与参考不连通，不可比</span>';
+    } else if (e.kind === "added") {
+      baseInterval = "—";
+      revisedInterval = fmtInterval(e.revised_low, e.revised_high);
+      lowCell = highCell = '<span class="delta-na">—</span>';
+      summary = '<span class="evidence-lines">仅修订版存在</span>';
+    } else if (e.kind === "removed") {
+      baseInterval = fmtInterval(e.base_low, e.base_high);
+      revisedInterval = "—";
+      lowCell = highCell = '<span class="delta-na">—</span>';
+      summary = '<span class="evidence-lines">仅基准版存在</span>';
+    } else {
+      baseInterval = fmtInterval(e.base_low, e.base_high);
+      revisedInterval = fmtInterval(e.revised_low, e.revised_high);
+      const dl = fmtEndpointDelta(e, "lower");
+      const dh = fmtEndpointDelta(e, "upper");
+      lowCell = `<span class="${dl.cls}">${esc(dl.text)}</span>`;
+      highCell = `<span class="${dh.cls}">${esc(dh.text)}</span>`;
+      summary = evidenceSummary(e) || '<span class="evidence-lines">两版界值一致</span>';
     }
+
     return `<tr>
       <td><span class="kind-tag ${renderKind}">${esc(KIND_LABEL[renderKind] || renderKind)}</span></td>
-      <td>${esc(e.event)}</td>
-      <td class="num">${fmtMinute(e.base_minute)}</td>
-      <td class="num">${fmtMinute(e.revised_minute)}</td>
-      <td class="num ${d.cls}">${d.text}</td>
-      <td>${lines}</td>
+      <td>${eventCell}</td>
+      <td class="num">${baseInterval}</td>
+      <td class="num">${revisedInterval}</td>
+      <td class="num">${lowCell}</td>
+      <td class="num">${highCell}</td>
+      <td>${summary}</td>
     </tr>`;
   }).join("");
 
-  const shiftNote = data.anchor_shifted
-    ? `<p class="muted">⚠ 两版第 0 分钟事件不同（基准：${esc(data.base.anchor)}；修订：${esc(data.revised.anchor)}）。
-       分钟数仍各自从本版最早事件起算；与公共锚点不连通的事件标为<strong>“不可比”</strong>，其分钟差只是各事件组件独立归零的结果，不构成修订变化。</p>`
-    : `<p class="muted">两版共同以“${esc(data.base.anchor)}”为第 0 分钟事件，变化分钟数即相对同一锚点的时刻差。</p>`;
+  const refNote = reference
+    ? `<p class="muted">两版共享参考事件为 <strong>${esc(reference)}</strong>（基准文本中首次出现的共同事件）：
+       对每个共同事件分别求两版中它相对参考事件的<strong>最紧时间差上下界</strong>，
+       <strong>任一端点（下界或上界）变化才计为变化</strong>；不比较两版各自“最早事件归零”的样本时刻，
+       新增事件不会再把其他共同事件误报为整体推迟/提前。事件在任一版中与参考事件互不连通时标为
+       <strong>“不可比”</strong>，不显示端点差值与变化证据。</p>`
+    : `<p class="muted">两版<strong>没有共同事件</strong>，无法以共同参考比较时间差，仅列出新增与删除事件。</p>`;
 
   const banner = `
     <div class="banner ok">
       <h2>✓ 两版比较完成</h2>
-      <p>共同事件 ${data.common_count} 个（其中 <strong>${data.changed_count}</strong> 个分钟发生变化）；
-      修订版新增 <strong>${data.added_count}</strong> 个事件、删除 <strong>${data.removed_count}</strong> 个事件
-      ${data.incomparable_count ? `、<strong>${data.incomparable_count}</strong> 个事件与锚点不连通、不可比` : ""}。
+      <p>共同事件 ${data.common_count} 个（可比 ${data.comparable_count} 个，其中 <strong>${data.changed_count}</strong> 个事件的端点发生变化
+      ${data.incomparable_count ? `、<strong>${data.incomparable_count}</strong> 个与参考不连通、不可比` : ""}）；
+      修订版新增 <strong>${data.added_count}</strong> 个事件、删除 <strong>${data.removed_count}</strong> 个事件。
       基准 ${data.base.line_count} 行 / ${data.base.event_count} 事件；修订 ${data.revised.line_count} 行 / ${data.revised.event_count} 事件。</p>
     </div>`;
 
   const tableCard = `
     <div class="card">
-      <h3>事件对齐表</h3>
+      <h3>事件区间对照表（共同事件相对参考事件 ${reference ? esc(reference) : "—"}）</h3>
       <table>
         <thead><tr>
           <th>类型</th><th>事件</th>
-          <th class="num">基准时刻</th><th class="num">修订时刻</th>
-          <th class="num">变化分钟</th><th>导致变化的修订行</th>
+          <th class="num">基准区间</th><th class="num">修订区间</th>
+          <th class="num">下界差值</th><th class="num">上界差值</th>
+          <th>变化端点与两版所用行</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
-      ${shiftNote}
+      ${refNote}
     </div>`;
 
-  // 仅为“分钟发生变化”的共同事件展开修订时刻的推导路径证据
-  const evidenceCards = data.alignment
-    .filter((e) => e.kind === "common" && e.evidence && !e.evidence.is_anchor)
-    .map((e) => {
-      const ev = e.evidence;
-      const d = fmtDelta(e.delta);
-      const dirText = ev.direction === "upper"
-        ? `修订时刻顶在该事件相对锚点的最紧<strong>上界 ${ev.bound}</strong>。`
-        : `修订时刻顶在该事件相对锚点的最紧<strong>下界 ${ev.bound}</strong>。`;
-      return `
-      <div class="card evidence-card">
-        <h3>变更行证据：${esc(e.event)}（${e.base_minute} → ${e.revised_minute}，${d.text} 分钟）</h3>
-        <p class="ev-head">${dirText}推出该时刻用到的修订行为<strong>第 ${ev.lines.join("、")} 行</strong>；
-        路径每环标注修订行号、所用界值，以及该行相对基准是“已修改 / 新增 / 区间未改”。</p>
-        ${pathChainHtml(ev.path)}
-        ${comparePathTableHtml(ev.path)}
-      </div>`;
-    }).join("");
+  // 为每个端点发生变化的共同事件分别展开证据卡：两版各自的原始行号、界值与连续推导路径
+  const evidenceCards = reference
+    ? data.alignment
+      .filter((e) => e.kind === "common" && e.changed && e.evidence)
+      .flatMap((e) => ["lower", "upper"]
+        .filter((side) => e.evidence[side])
+        .map((side) => endpointEvidenceCard(reference, e, side)))
+      .join("")
+    : "";
 
   compareEl.innerHTML = banner + tableCard + evidenceCards;
 }

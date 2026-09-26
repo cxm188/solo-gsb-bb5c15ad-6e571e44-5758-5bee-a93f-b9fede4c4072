@@ -225,9 +225,10 @@
     <section class="input-area">
       <label><strong>两版比较（基准文本 / 修订文本）</strong></label>
       <p class="muted" style="margin-top:0">
-        分别粘贴<strong>基准版</strong>与<strong>修订版</strong>区间文本，后端各自独立校验、独立联立后按事件名对齐：
-        标出共同事件的基准/修订时刻与<strong>变化分钟数</strong>，并给出<strong>导致变化的修订行号</strong>及其推导路径；
-        同时列出修订版<strong>新增</strong>、<strong>删除</strong>的事件。任一版校验无效或存在矛盾时，分别显示该版错误或闭合矛盾链，不生成差异结论。
+        分别粘贴<strong>基准版</strong>与<strong>修订版</strong>区间文本，后端各自独立校验、独立联立；以基准中首次出现的<strong>共同事件</strong>为两版<strong>共享参考</strong>，
+        比较每个共同事件相对它的<strong>最紧时间差上下界</strong>，<strong>任一端点变化才计为变化</strong>（不比较各自归零的样本时刻，新增事件不会把其他事件误报为推迟）；
+        表格给出两版区间与端点差值，变化端点附<strong>两版各自的原始行号、所用界值与连续推导路径</strong>。仅在两版中均与参考连通时可比，否则标为<strong>不可比</strong>；没有共同事件时只列新增、删除。
+        任一版校验无效或存在矛盾时，分别显示该版错误或闭合矛盾链，不生成差异结论。
       </p>
       <div class="compare-grid">
         <div>

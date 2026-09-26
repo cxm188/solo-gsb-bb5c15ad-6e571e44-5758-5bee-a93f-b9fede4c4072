@@ -26,9 +26,14 @@ Bellman-Ford 联立。同组内的区间（两端归并为同一事件）成为�
 
 两版比较（compare_texts）：基准文本与修订文本各自独立 parse_text + solve_rows，
 任一版校验失败或存在负环时，分别原样带上该版错误/闭合矛盾链，不生成差异结论；
-两版均可解时，以“最早事件第 0 分钟”的规范化时刻按事件名对齐，列出共同事件的
-两版时刻与变化分钟数，并用 _derive_bound 复用冗余核对同款最短路推导，
-把推出修订时刻的修订行（原始行号、所用界值）作为变化证据；同时给出新增、删除事件。
+两版均可解时，取基准文本中首次出现的共同事件作为两版共享参考事件，对每个共同事件
+在两版中分别用 _derive_bound（冗余核对同款最短路推导）求其相对参考事件时间差的最紧
+上下界（上界 = 参考→事件最短路，下界 = 事件→参考最短路取负）。只有某一端点（下界或
+上界）在两版间不同才把该事件计为变化——不比较两版各自“最早事件归零”的样本时刻
+（新增事件会改变另一版的归零原点，样本时刻差只是平移假象）。事件在任一版中两个方向
+都与参考不通时标为不可比，不给出端点差值与变化证据；没有共同事件时只列新增、删除。
+变化端点给出两版各自的连续推导路径（原始行号、所用界值），修订版路径上的行另标注
+相对基准是新增/已修改/区间未改。
 
 冲突单行修订建议（suggest_repairs）：文本语法有效但联立矛盾时，逐行暂时移除该行的
 上、下界约束；其余行仍矛盾的行排除，其余可解时用冗余核对同款最短路求这两个事件
@@ -639,51 +644,61 @@ def check_redundancy(text: str, line: int) -> dict:
 
 # ---------- 两版比较 ----------
 
-def _evidence_for(system: dict, anchor: str, target: str, minute: int, annotate) -> dict | None:
-    """修订版中确定 target 相对第 0 分钟事件 anchor 的规范化时刻的推导路径证据。
+def _bounds_relative_to(system: dict, reference: str, target: str) -> dict:
+    """target 相对参考事件 reference 的最紧时间差区间 [下界, 上界] 与两端连续推导路径。
 
-    复用冗余核对同款 _derive_bound：anchor -> target 最短路给出最紧上界，
-    target -> anchor 最短路取负给出最紧下界；规范化可行解恰好顶在其中一个紧界上，
-    选中与 minute 相等的那条路径，路径上的修订行原始行号即“导致变化的修订行号”。
-    target 与 anchor 不连通（属于另一个独立事件组件）时返回 None：两版各按自己的
-    最早事件归零，该事件的“分钟变化”只是规范化假象，不构成可比差异。
+    复用冗余核对同款 _derive_bound：reference -> target 最短路给出 t(target) − t(ref)
+    的最紧上界；target -> reference 最短路取负给出最紧下界。某方向不可达时对应端点
+    无界（None）、路径为空；target 即参考事件本身时区间恒为 [0, 0]、路径为空。
+    两端都无界（两个方向都不通）表示 target 与参考事件分属互不连通的约束组件。
     """
     names = system["names"]
     edges = system["edges"]
     index = system["index"]
-    ia, it = index[anchor], index[target]
+    iref, itarget = index[reference], index[target]
+    if iref == itarget:
+        return {"low": 0, "high": 0, "lower_path": [], "upper_path": []}
 
-    if ia == it:
-        return {"is_anchor": True, "direction": None, "bound": 0, "lines": [], "path": []}
+    upper_val, upper_path = _derive_bound(names, edges, iref, itarget)
+    back_val, back_path = _derive_bound(names, edges, itarget, iref)
+    return {
+        "low": -back_val if back_val is not None else None,
+        "high": upper_val,
+        "lower_path": back_path,
+        "upper_path": upper_path,
+    }
 
-    upper_val, upper_path = _derive_bound(names, edges, ia, it)
-    back_val, back_path = _derive_bound(names, edges, it, ia)
-    lower_val = -back_val if back_val is not None else None
-    if upper_val is None and lower_val is None:
-        return None  # target 与锚点分属互不连通的事件组件，无法相对比较
 
-    if lower_val is not None and lower_val == minute:
-        path, direction, bound = back_path, "lower", lower_val
-    elif upper_val is not None and upper_val == minute:
-        path, direction, bound = upper_path, "upper", upper_val
-    elif lower_val is not None:  # 防御性回退：正常情况下必有一个紧界等于 minute
-        path, direction, bound = back_path, "lower", lower_val
+def _endpoint_evidence(bounds: dict, side: str, annotate) -> dict:
+    """一个端点（"lower" 下界 / "upper" 上界）在某一版中的变化证据。
+
+    含该端点在这一版中的界值（无界为 None）、连续推导路径所用的原始行号（去重保序）
+    与逐环路径步骤（原始行号、所用界与界值）；无界时路径为空。
+    """
+    if side == "lower":
+        bound, path = bounds["low"], bounds["lower_path"]
     else:
-        path, direction, bound = upper_path, "upper", upper_val
-
+        bound, path = bounds["high"], bounds["upper_path"]
     path = annotate(path)
     lines: list[int] = []
     for step in path:  # 同一行的上、下界极端情况下可能都在路径上，行号去重保序
         if step["line"] not in lines:
             lines.append(step["line"])
-    return {"is_anchor": False, "direction": direction, "bound": bound, "lines": lines, "path": path}
+    return {"bound": bound, "bounded": bound is not None, "lines": lines, "path": path}
 
 
 def compare_texts(base_text: str, revised_text: str) -> dict:
-    """两版独立校验、独立联立后按事件名对齐比较。
+    """两版独立校验、独立联立后，以基准中首次出现的共同事件为共享参考进行比较。
 
-    任一版无效（error）或互相矛盾（conflict）时，不生成差异结论，
-    分别在 base / revised 字段中带回该版的完整公开求解结果（错误列表或闭合矛盾链）。
+    任一版无效（error）或互相矛盾（conflict）时，不生成差异结论，分别在 base / revised
+    字段中带回该版的完整公开求解结果（错误列表或闭合矛盾链）。
+
+    两版均可解时取基准文本中首次出现的共同事件为两版共享参考事件，对每个共同事件
+    在两版中分别求其相对参考事件时间差的最紧上下界（复用冗余核对同款 _derive_bound）：
+    任一端点（下界或上界）在两版间不同才把该事件计为变化，绝不比较两版各自“最早事件
+    归零”的样本时刻（新增事件会改变另一版的归零原点，样本时刻差只是整体平移假象）。
+    事件在任一版中两个方向都与参考不通时标为不可比，不给出端点差值与变化证据。
+    没有共同事件时只列新增、删除事件。变化端点附两版各自的连续推导路径证据。
     """
     base_rows, base_res = _parse_and_solve(base_text)
     revised_rows, revised_res = _parse_and_solve(revised_text)
@@ -697,17 +712,11 @@ def compare_texts(base_text: str, revised_text: str) -> dict:
 
     b_names = base_res["names"]
     r_names = revised_res["names"]
-    b_minute = dict(zip(b_names, base_res["minutes"]))
-    r_minute = dict(zip(r_names, revised_res["minutes"]))
     b_set, r_set = set(b_names), set(r_names)
 
-    # 两版各自“第 0 分钟”的事件；优先选用两版共有的第 0 分钟事件作锚点，
-    # 使共同事件的变化分钟数不夹带整体平移；没有共有锚点时各取本版最早事件。
-    b_zeros = [name for name in b_names if b_minute[name] == 0]
-    r_zeros = [name for name in r_names if r_minute[name] == 0]
-    common_zero = next((name for name in b_zeros if name in r_zeros), None)
-    base_anchor = common_zero or b_zeros[0]
-    revised_anchor = common_zero or r_zeros[0]
+    # 共享参考：基准文本中首次出现的共同事件；没有共同事件时不做任何区间比较
+    common = [name for name in b_names if name in r_set]
+    reference = common[0] if common else None
 
     # 基准行按书写事件对索引，用于标注修订行相对基准是“新增/修改/未变”
     base_pairs: dict[tuple[str, str], list[tuple[int, int]]] = {}
@@ -728,73 +737,132 @@ def compare_texts(base_text: str, revised_text: str) -> dict:
             step["change"] = label
         return path
 
+    # 每个事件在两版中相对参考事件的最紧区间与推导路径（无共同事件时没有参考，不求）
+    base_bounds_of: dict[str, dict] = {}
+    revised_bounds_of: dict[str, dict] = {}
+    if reference is not None:
+        for name in b_names:
+            base_bounds_of[name] = _bounds_relative_to(base_res, reference, name)
+        for name in r_names:
+            revised_bounds_of[name] = _bounds_relative_to(revised_res, reference, name)
+
     alignment: list[dict] = []
     changed_count = 0
+    incomparable_count = 0
+    comparable_count = 0
 
     # 共同事件：按基准版首次出现顺序对齐
-    incomparable_count = 0
-    for name in b_names:
-        if name not in r_set:
-            continue
-        bm, rm = b_minute[name], r_minute[name]
-        delta = rm - bm
+    for name in common:
+        bb, rb = base_bounds_of[name], revised_bounds_of[name]
+        is_reference = name == reference
+        b_connected = bb["low"] is not None or bb["high"] is not None
+        r_connected = rb["low"] is not None or rb["high"] is not None
         entry: dict = {
             "kind": "common",
             "event": name,
-            "base_minute": bm,
-            "revised_minute": rm,
-            "delta": delta,
+            "is_reference": is_reference,
+            "base_low": bb["low"],
+            "base_high": bb["high"],
+            "revised_low": rb["low"],
+            "revised_high": rb["high"],
+            "low_delta": None,
+            "high_delta": None,
+            "low_changed": False,
+            "high_changed": False,
+            "changed": False,
             "evidence": None,
         }
-        if delta != 0:
-            evidence = _evidence_for(revised_res, revised_anchor, name, rm, annotate)
-            if evidence is None:
-                # 与两版公共锚点不连通：分钟差只是各组件独立归零的假象，不判为变化
-                entry["kind"] = "incomparable"
-                incomparable_count += 1
-            else:
-                changed_count += 1
-                entry["evidence"] = evidence
+        if not (b_connected and r_connected):
+            # 任一版中与参考事件两个方向都不通：不可比，隐藏端点差值与变化证据
+            entry["kind"] = "incomparable"
+            incomparable_count += 1
+            alignment.append(entry)
+            continue
+
+        comparable_count += 1
+        low_changed = bb["low"] != rb["low"]
+        high_changed = bb["high"] != rb["high"]
+        entry["low_changed"] = low_changed
+        entry["high_changed"] = high_changed
+        # 两端在两版中都有界时给出端点差值（分钟）；一端无界时由页面展示“界 ↔ 无界”
+        if bb["low"] is not None and rb["low"] is not None:
+            entry["low_delta"] = rb["low"] - bb["low"]
+        if bb["high"] is not None and rb["high"] is not None:
+            entry["high_delta"] = rb["high"] - bb["high"]
+
+        if low_changed or high_changed:
+            changed_count += 1
+            entry["changed"] = True
+            evidence: dict = {"lower": None, "upper": None}
+            if low_changed:
+                # 变化端点：两版各自的原始行号、所用界值与连续推导路径
+                evidence["lower"] = {
+                    "base": _endpoint_evidence(bb, "lower", lambda p: p),
+                    "revised": _endpoint_evidence(rb, "lower", annotate),
+                }
+            if high_changed:
+                evidence["upper"] = {
+                    "base": _endpoint_evidence(bb, "upper", lambda p: p),
+                    "revised": _endpoint_evidence(rb, "upper", annotate),
+                }
+            entry["evidence"] = evidence
         alignment.append(entry)
 
-    # 删除事件：仅基准版存在（保持基准版首次出现顺序）
+    # 删除事件：仅基准版存在（保持基准版首次出现顺序）；给出它在基准中相对参考的区间
     for name in b_names:
-        if name not in r_set:
-            alignment.append({
-                "kind": "removed",
-                "event": name,
-                "base_minute": b_minute[name],
-                "revised_minute": None,
-                "delta": None,
-                "evidence": None,
-            })
+        if name in r_set:
+            continue
+        bb = base_bounds_of.get(name)
+        alignment.append({
+            "kind": "removed",
+            "event": name,
+            "is_reference": False,
+            "base_low": bb["low"] if bb is not None else None,
+            "base_high": bb["high"] if bb is not None else None,
+            "revised_low": None,
+            "revised_high": None,
+            "low_delta": None,
+            "high_delta": None,
+            "low_changed": False,
+            "high_changed": False,
+            "changed": False,
+            "evidence": None,
+        })
 
-    # 新增事件：仅修订版存在（保持修订版首次出现顺序）
+    # 新增事件：仅修订版存在（保持修订版首次出现顺序）；给出它在修订中相对参考的区间
     for name in r_names:
-        if name not in b_set:
-            alignment.append({
-                "kind": "added",
-                "event": name,
-                "base_minute": None,
-                "revised_minute": r_minute[name],
-                "delta": None,
-                "evidence": None,
-            })
+        if name in b_set:
+            continue
+        rb = revised_bounds_of.get(name)
+        alignment.append({
+            "kind": "added",
+            "event": name,
+            "is_reference": False,
+            "base_low": None,
+            "base_high": None,
+            "revised_low": rb["low"] if rb is not None else None,
+            "revised_high": rb["high"] if rb is not None else None,
+            "low_delta": None,
+            "high_delta": None,
+            "low_changed": False,
+            "high_changed": False,
+            "changed": False,
+            "evidence": None,
+        })
 
     return {
         "status": "ok",
+        "reference": reference,
         "base": {
             "event_count": len(b_names),
             "line_count": len(base_rows),
-            "anchor": base_anchor,
         },
         "revised": {
             "event_count": len(r_names),
             "line_count": len(revised_rows),
-            "anchor": revised_anchor,
         },
-        "anchor_shifted": base_anchor != revised_anchor,
-        "common_count": len(b_set & r_set),
+        "common_count": len(common),
+        "comparable_count": comparable_count,
         "changed_count": changed_count,
         "incomparable_count": incomparable_count,
         "added_count": len(r_set - b_set),
